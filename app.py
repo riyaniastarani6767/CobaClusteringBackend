@@ -10,6 +10,11 @@ import pandas as pd
 from werkzeug.utils import secure_filename
 from sqlalchemy.orm import Session
 from fastapi import Depends  # Kita pinjam konsep Depends untuk get_db
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import numpy as np
+import pickle
 app = Flask(__name__)
 # Impor model dan koneksi DB Anda
 # Sesuaikan path impor ini dengan struktur proyek Anda
@@ -473,6 +478,205 @@ def save_processed_data():
         if os.path.exists(temp_filepath):
             os.remove(temp_filepath)
         db.close()
+
+
+# Fungsi helper untuk load temporary dataframe
+def load_temp_dataframe(temp_filename, upload_folder):
+    """Load DataFrame dari file temporary berdasarkan ekstensi"""
+    temp_filepath = os.path.join(upload_folder, temp_filename)
+    
+    if not os.path.exists(temp_filepath):
+        raise FileNotFoundError(f"File temporary {temp_filename} tidak ditemukan")
+    
+    if temp_filename.endswith('.parquet'):
+        return pd.read_parquet(temp_filepath)
+    elif temp_filename.endswith('.pkl'):
+        return pd.read_pickle(temp_filepath)
+    elif temp_filename.endswith('.csv'):
+        return pd.read_csv(temp_filepath, parse_dates=['tanggal_transaksi'])
+    else:
+        raise ValueError(f"Format file {temp_filename} tidak didukung")
+
+@app.route("/clustering/parameters", methods=["GET"])
+def get_clustering_parameters():
+    """Get available clustering parameters and options"""
+    try:
+        return jsonify({
+            "clustering_methods": [
+                {"value": "kmeans", "label": "K-Means", "description": "Clustering berdasarkan jarak ke centroid"},
+                {"value": "kmeans_plus", "label": "K-Means++", "description": "K-Means dengan inisialisasi yang lebih baik"}
+            ],
+            "cluster_options": {
+                "min_clusters": 2,
+                "max_clusters": 10,
+                "default_clusters": 3
+            },
+            "feature_options": [
+                {"value": "total_pembelian", "label": "Total Pembelian", "description": "Jumlah total pembelian per produk"},
+                {"value": "frekuensi_pembelian", "label": "Frekuensi Pembelian", "description": "Berapa kali produk dibeli"},
+                {"value": "rata_rata_harga", "label": "Rata-rata Harga", "description": "Harga rata-rata produk"},
+                {"value": "total_revenue", "label": "Total Revenue", "description": "Total pendapatan dari produk"}
+            ]
+        }), 200
+    except Exception as e:
+        print(f"[DEBUG] Error get clustering parameters: {str(e)}")
+        return jsonify({"message": f"Error: {str(e)}"}), 500
+
+@app.route("/clustering/process", methods=["POST"])
+def process_clustering():
+    """Process clustering on uploaded data"""
+    try:
+        data = request.get_json()
+        temp_file_id = data.get('temp_file_id')
+        clustering_method = data.get('clustering_method', 'kmeans')
+        n_clusters = int(data.get('n_clusters', 3))
+        selected_features = data.get('selected_features', ['total_pembelian', 'frekuensi_pembelian'])
+        
+        print(f"[DEBUG] Processing clustering with {n_clusters} clusters using {clustering_method}")
+        
+        if not temp_file_id:
+            return jsonify({"message": "temp_file_id diperlukan"}), 400
+        
+        # Load data dari temporary file
+        df = load_temp_dataframe(temp_file_id, app.config['UPLOAD_FOLDER'])
+        print(f"[DEBUG] Loaded data dengan {len(df)} baris")
+        
+        # Prepare features untuk clustering
+        features_df = prepare_clustering_features(df)
+        print(f"[DEBUG] Prepared features: {features_df.columns.tolist()}")
+        
+        # Filter features berdasarkan pilihan user
+        available_features = []
+        for feature in selected_features:
+            if feature in features_df.columns:
+                available_features.append(feature)
+        
+        if len(available_features) < 2:
+            return jsonify({"message": "Minimal 2 fitur diperlukan untuk clustering"}), 400
+        
+        clustering_data = features_df[available_features]
+        
+        # Standardize data
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(clustering_data)
+        
+        # Perform clustering
+        if clustering_method == 'kmeans_plus':
+            kmeans = KMeans(n_clusters=n_clusters, init='k-means++', random_state=42, n_init=10)
+        else:
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        
+        cluster_labels = kmeans.fit_predict(scaled_data)
+        
+        # Add cluster labels to features dataframe
+        features_df['cluster'] = cluster_labels
+        
+        # Calculate cluster statistics
+        cluster_stats = calculate_cluster_statistics(features_df, available_features)
+        
+        # Prepare visualization data (PCA for 2D visualization)
+        pca = PCA(n_components=2)
+        pca_data = pca.fit_transform(scaled_data)
+        
+        visualization_data = []
+        for i in range(len(pca_data)):
+            visualization_data.append({
+                'x': float(pca_data[i][0]),
+                'y': float(pca_data[i][1]),
+                'cluster': int(cluster_labels[i]),
+                'nama_produk': features_df.iloc[i]['nama_produk'] if 'nama_produk' in features_df.columns else f"Produk {i+1}"
+            })
+        
+        # Save clustering results
+        results_filename = f"clustering_results_{uuid.uuid4()}.pkl"
+        results_filepath = os.path.join(app.config['UPLOAD_FOLDER'], results_filename)
+        
+        clustering_results = {
+            'features_df': features_df,
+            'cluster_labels': cluster_labels,
+            'scaler': scaler,
+            'kmeans_model': kmeans,
+            'selected_features': available_features
+        }
+        
+        with open(results_filepath, 'wb') as f:
+            pickle.dump(clustering_results, f)
+        
+        return jsonify({
+            "message": "Clustering berhasil diproses",
+            "results_file_id": results_filename,
+            "cluster_count": n_clusters,
+            "features_used": available_features,
+            "cluster_statistics": cluster_stats,
+            "visualization_data": visualization_data,
+            "pca_explained_variance": [float(var) for var in pca.explained_variance_ratio_]
+        }), 200
+    
+    except Exception as e:
+        print(f"[DEBUG] Error processing clustering: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Error saat memproses clustering: {str(e)}"}), 500
+
+def prepare_clustering_features(df):
+    """Prepare features for clustering from transaction data"""
+    print("[DEBUG] Preparing clustering features...")
+    
+    # Aggregate data per produk
+    features = df.groupby('nama_produk').agg({
+        'jumlah_terjual': ['sum', 'count', 'mean'],
+        'harga': ['mean', 'std'],
+        'tanggal_transaksi': ['count']
+    }).reset_index()
+    
+    # Flatten column names
+    features.columns = [
+        'nama_produk',
+        'total_pembelian',      # sum of jumlah_terjual
+        'frekuensi_pembelian',  # count of transactions
+        'rata_rata_pembelian',  # mean of jumlah_terjual
+        'rata_rata_harga',      # mean of harga
+        'std_harga',           # std of harga
+        'jumlah_transaksi'     # count of transactions (duplicate)
+    ]
+    
+    # Calculate additional features
+    features['total_revenue'] = features['total_pembelian'] * features['rata_rata_harga']
+    features['coefficient_variation_harga'] = features['std_harga'] / features['rata_rata_harga']
+    
+    # Fill NaN values
+    features = features.fillna(0)
+    
+    print(f"[DEBUG] Features prepared: {features.shape}")
+    return features
+
+def calculate_cluster_statistics(features_df, selected_features):
+    """Calculate statistics for each cluster"""
+    cluster_stats = {}
+    
+    for cluster_id in sorted(features_df['cluster'].unique()):
+        cluster_data = features_df[features_df['cluster'] == cluster_id]
+        
+        stats = {
+            'cluster_id': int(cluster_id),
+            'product_count': len(cluster_data),
+            'products': cluster_data['nama_produk'].tolist()[:10],  # Max 10 products for preview
+            'feature_stats': {}
+        }
+        
+        for feature in selected_features:
+            if feature in cluster_data.columns:
+                stats['feature_stats'][feature] = {
+                    'mean': float(cluster_data[feature].mean()),
+                    'median': float(cluster_data[feature].median()),
+                    'std': float(cluster_data[feature].std()),
+                    'min': float(cluster_data[feature].min()),
+                    'max': float(cluster_data[feature].max())
+                }
+        
+        cluster_stats[f'cluster_{cluster_id}'] = stats
+    
+    return cluster_stats
 if __name__ == "__main__":
     print("🚀 Starting Flask test server...")
     print("📍 Server will be available at:")
