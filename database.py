@@ -14,3 +14,19 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+# =========================================================
+# === BAGIAN YANG HILANG SEBELUMNYA ADA DI SINI ===
+# =========================================================
+def get_db():
+    """
+    Fungsi ini akan membuat dan menyediakan sesi database untuk setiap
+    permintaan API, dan akan selalu memastikan sesi ditutup setelahnya.
+    """
+    db = SessionLocal()
+    try:
+        yield db  # 'yield' akan memberikan sesi ke endpoint
+    finally:
+        db.close() # 'finally' memastikan ini selalu dijalankan, bahkan jika ada error
+# =========================================================
